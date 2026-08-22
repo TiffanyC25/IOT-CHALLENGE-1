@@ -1,0 +1,225 @@
+/*
+  =====================================================================
+  Componentes:
+    - HC-SR04   : sensor ultrasónico -> nivel de agua (distancia)
+    - DHT22     : temperatura y humedad relativa del aire
+    - BMP180    : presión atmosférica 
+    - BH1750    : luxómetro usado como pseudo-piranómetro 
+    - Buzzer    : alerta sonora in situ
+    - LCD 16x2 PARALELO: despliegue local de datos y estado de alerta
+  =====================================================================
+*/
+
+#include <Wire.h>
+#include <DHT.h>
+#include <Adafruit_BMP085.h>  
+#include <BH1750.h>
+#include <LiquidCrystal.h>     // LCD paralelo (modo 4 bits)
+
+// ---------------------- CONFIGURACIÓN DE PINES ----------------------
+#define PIN_TRIG      9
+#define PIN_ECHO      10
+#define PIN_DHT       7
+#define PIN_BUZZER    8
+
+// LCD paralelo en modo 4 bits: RS, E, D4, D5, D6, D7 (pines del LCD)
+#define LCD_RS 2
+#define LCD_E  3
+#define LCD_D4 4
+#define LCD_D5 5
+#define LCD_D6 6
+#define LCD_D7 11
+
+#define DHTTYPE DHT22
+
+// ---------------------- OBJETOS DE SENSORES --------------------------
+DHT dht(PIN_DHT, DHTTYPE);
+Adafruit_BMP085 bmp;            
+BH1750 lightMeter;
+LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+
+// ---------------------- PARÁMETROS DEL SISTEMA ------------------------
+const float ALTURA_TANQUE_CM   = 200.0;  // altura del sensor al fondo (ajustar a campo)
+const float NIVEL_ALERTA_CM    = 40.0;   // nivel mínimo de agua para disparar alerta (cm)
+const float ETO_ALERTA_MMDIA   = 6.0;    // evapotranspiración diaria alta (mm/día) -> alerta
+const float u2_fijo            = 2.0;    // viento asumido (m/s) - reemplazar si se agrega anemómetro
+const float ALBEDO             = 0.23;   // albedo superficie de referencia
+
+unsigned long ultimaLectura = 0;
+const unsigned long INTERVALO_MS = 5000; // lectura cada 5 s
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  dht.begin();
+  Wire.begin();
+
+  if (!bmp.begin()) {
+    Serial.println("ERROR: BMP180 no detectado");
+  }
+
+  lightMeter.begin();
+
+  lcd.begin(16, 2);
+  lcd.setCursor(0, 0);
+  lcd.print("Iniciando...");
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  if (millis() - ultimaLectura >= INTERVALO_MS) {
+    ultimaLectura = millis();
+
+    // ---------- 1. LECTURA DE SENSORES ----------
+    float distancia_cm = leerDistanciaHCSR04();
+    float nivel_agua_cm = ALTURA_TANQUE_CM - distancia_cm;
+    if (nivel_agua_cm < 0) nivel_agua_cm = 0;
+
+    float humedad = dht.readHumidity();
+    float temp_dht = dht.readTemperature();
+
+    float presion_hPa = bmp.readPressure() / 100.0;   // Pa -> hPa
+    float temp_bmp = bmp.readTemperature();
+
+    float lux = lightMeter.readLightLevel();
+    float radiacion_Wm2 = lux / 126.0; // conversión aproximada lux -> W/m² (luz solar)
+
+    // Validación básica de lecturas
+    if (isnan(humedad) || isnan(temp_dht)) {
+      Serial.println("ERROR: fallo lectura DHT22");
+      return;
+    }
+
+    // Se usa temperatura del DHT22 como referencia principal del aire
+    float T = temp_dht;
+
+    // ---------- 2. CÁLCULO ETo (Penman-Monteith FAO-56, simplificado) ----------
+    float ETo = calcularPenmanMonteith(T, humedad, presion_hPa, radiacion_Wm2, u2_fijo);
+
+    // ---------- 3. LÓGICA DE FUSIÓN DE SEÑALES ----------
+    bool alertaNivel = (nivel_agua_cm <= NIVEL_ALERTA_CM);
+    bool alertaEvaporacion = (ETo >= ETO_ALERTA_MMDIA);
+    bool alertaClimatica = (humedad < 20.0 || presion_hPa < 1000.0); // ejemplo: aire muy seco / baja presión
+
+    // Alerta general: se activa si ocurre nivel crítico Y (evaporación alta O condición climática anómala)
+    // Esto es "fusión de señales": una sola variable no dispara la alerta más grave,
+    // se requiere coincidencia de múltiples condiciones para reducir falsos positivos.
+    bool alertaCritica = alertaNivel && (alertaEvaporacion || alertaClimatica);
+
+    // ---------- 4. SALIDA POR SERIAL (para depuración / registro) ----------
+    Serial.println("=================================");
+    Serial.print("Nivel agua (cm): "); Serial.println(nivel_agua_cm);
+    Serial.print("Temp (C): "); Serial.println(T);
+    Serial.print("Humedad (%): "); Serial.println(humedad);
+    Serial.print("Presion (hPa): "); Serial.println(presion_hPa);
+    Serial.print("Radiacion (W/m2): "); Serial.println(radiacion_Wm2);
+    Serial.print("ETo (mm/dia): "); Serial.println(ETo);
+    Serial.print("ALERTA CRITICA: "); Serial.println(alertaCritica ? "SI" : "NO");
+
+    // ---------- 5. SALIDA LCD ----------
+    mostrarLCD(nivel_agua_cm, T, humedad, ETo, alertaCritica);
+
+    // ---------- 6. ACTUADOR: BUZZER ----------
+    if (alertaCritica) {
+      activarBuzzerAlerta();
+    } else {
+      noTone(PIN_BUZZER);
+    }
+  }
+}
+
+// =====================================================================
+// FUNCIONES AUXILIARES
+// =====================================================================
+
+float leerDistanciaHCSR04() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duracion = pulseIn(PIN_ECHO, HIGH, 30000); // timeout 30 ms
+  if (duracion == 0) return ALTURA_TANQUE_CM; // sin eco -> asumir vacío
+
+  float distancia = duracion * 0.0343 / 2.0; // cm
+  return distancia;
+}
+
+void activarBuzzerAlerta() {
+  // patrón intermitente para diferenciarlo de un tono constante de falla
+  tone(PIN_BUZZER, 2000);
+  delay(200);
+  noTone(PIN_BUZZER);
+  delay(150);
+}
+
+void mostrarLCD(float nivel, float temp, float hum, float eto, bool alerta) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  if (alerta) {
+    lcd.print("*** ALERTA ***");
+  } else {
+    lcd.print("Nivel:");
+    lcd.print(nivel, 0);
+    lcd.print("cm T:");
+    lcd.print(temp, 0);
+  }
+  lcd.setCursor(0, 1);
+  lcd.print("H:");
+  lcd.print(hum, 0);
+  lcd.print("% ETo:");
+  lcd.print(eto, 1);
+}
+
+/*
+  Cálculo simplificado de Evapotranspiración de referencia (ETo)
+  según FAO-56 Penman-Monteith:
+
+  ETo = [0.408*Δ*(Rn - G) + γ*(900/(T+273))*u2*(es - ea)]
+        ---------------------------------------------------
+                  Δ + γ*(1 + 0.34*u2)
+
+  Donde:
+    Δ  = pendiente curva de presión de vapor (kPa/°C)
+    Rn = radiación neta (MJ/m²/día)  -> aproximada aquí desde Rs (BH1750)
+    G  = flujo de calor del suelo (asumido 0, uso diario)
+    γ  = constante psicrométrica (kPa/°C), depende de presión atmosférica
+    T  = temperatura del aire (°C)
+    u2 = velocidad del viento a 2 m (m/s) -> FIJO por falta de anemómetro
+    es = presión de vapor de saturación (kPa)
+    ea = presión de vapor real (kPa), calculada con humedad relativa
+*/
+float calcularPenmanMonteith(float T, float HR, float presion_hPa, float radiacion_Wm2, float u2) {
+  // --- Presión de vapor de saturación (es) y real (ea) ---
+  float es = 0.6108 * exp((17.27 * T) / (T + 237.3));   // kPa
+  float ea = es * (HR / 100.0);                          // kPa
+
+  // --- Pendiente de la curva de presión de vapor (Δ) ---
+  float delta = (4098.0 * es) / pow((T + 237.3), 2);      // kPa/°C
+
+  // --- Constante psicrométrica (γ) ---
+  float presion_kPa = presion_hPa / 10.0;                 // hPa -> kPa
+  float gamma = 0.000665 * presion_kPa;                   // kPa/°C
+
+  // --- Radiación neta (Rn), aproximación simplificada ---
+  // Convertir W/m² a MJ/m²/día: 1 W/m2 = 0.0864 MJ/m2/dia
+  float Rs_MJ = radiacion_Wm2 * 0.0864;
+  float Rn = Rs_MJ * (1.0 - ALBEDO); // se omite balance de onda larga (simplificación educativa)
+  if (Rn < 0) Rn = 0;
+
+  float G = 0.0; // flujo de calor del suelo, despreciable en cálculo diario
+
+  // --- Ecuación de Penman-Monteith (FAO-56) ---
+  float numerador = 0.408 * delta * (Rn - G) + gamma * (900.0 / (T + 273.0)) * u2 * (es - ea);
+  float denominador = delta + gamma * (1.0 + 0.34 * u2);
+
+  float ETo = numerador / denominador; // mm/día
+  if (ETo < 0) ETo = 0;
+
+  return ETo;
+}
